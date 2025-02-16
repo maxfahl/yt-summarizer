@@ -57,7 +57,11 @@ def transcribe_audio(audio_path, model):
     Returns the transcription text.
     """
     logging.info(f"Transcribing audio: {audio_path}")
-    result = model.transcribe(audio_path)
+    # Suppress FP16 warning on CPU
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
+        result = model.transcribe(audio_path)
     transcription = result.get("text", "")
     logging.info("Transcription complete")
     return transcription
@@ -69,18 +73,18 @@ def summarize_transcription(transcription, openai_api_key):
     Returns the summary text.
     """
     logging.info("Summarizing transcription using ChatGPT")
-    openai.api_key = openai_api_key
+    client = openai.OpenAI(api_key=openai_api_key)
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-o3-mini",
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Changed from gpt-o3-mini which was invalid
             messages=[
-               {"role": "system", "content": "You are a helpful assistant that summarizes transcriptions."},
-               {"role": "user", "content": f"Please provide a concise summary for the following transcription:\n\n{transcription}"}
+                {"role": "system", "content": "You are a helpful assistant that summarizes transcriptions."},
+                {"role": "user", "content": f"Please provide a summary for the below transcription for a short blog post, including highlights, key points and the \"meaty\" parts.\n\n---\n\n{transcription}"}
             ],
-            max_tokens=150,
+            # max_tokens=150,
             temperature=0.5,
         )
-        summary = response.choices[0].message['content'].strip()
+        summary = response.choices[0].message.content.strip()
         logging.info("Summary complete")
         return summary
     except Exception as e:
