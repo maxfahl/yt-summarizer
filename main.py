@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import logging
 import os
 import subprocess
 import sys
@@ -7,64 +6,116 @@ import sys
 import openai
 import whisper
 import yt_dlp
-
-# Set up logging for clear step-by-step feedback
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+from tqdm.auto import tqdm
 
 
-def download_video(url, output_dir="downloads"):
+def clean_filename(s):
+    """Clean filename by removing spaces before punctuation and normalizing Unicode characters"""
+    import re
+    import unicodedata
+    # Normalize Unicode characters (NFKC handles full-width to half-width conversion)
+    s = unicodedata.normalize('NFKC', s)
+    # Remove spaces before punctuation
+    s = re.sub(r'\s+([?.!,)])', r'\1', s)
+    return s
+
+
+def download_video(url, output_dir="downloads", progress_bar=None):
     """
     Downloads a YouTube video from the given URL using yt-dlp.
     The video is saved in the specified output directory.
     Returns the path to the downloaded video file.
     """
-    logging.info(f"Downloading video from URL: {url}")
     os.makedirs(output_dir, exist_ok=True)
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            # Update downloaded bytes
+            if progress_bar is not None:
+                current = d.get('downloaded_bytes', 0)
+                total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                if total > 0:
+                    progress_bar.total = total
+                    progress_bar.n = current
+                    progress_bar.refresh()
+        elif d['status'] == 'finished' and progress_bar is not None:
+            progress_bar.n = progress_bar.total
+            progress_bar.refresh()
+
+    class QuietLogger:
+        def debug(self, msg): pass
+        def warning(self, msg): pass
+        def error(self, msg): pass
+
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
         'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
         'noplaylist': True,
+        'progress_hooks': [progress_hook],
+        'quiet': True,
+        'no_warnings': True,
+        'logger': QuietLogger(),
+        'noprogress': True,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        logging.info(f"Downloaded video saved to: {filename}")
-        return filename
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # First get info and clean the title
+            info = ydl.extract_info(url, download=False)
+            info['title'] = clean_filename(info['title'])
+            # Prepare filename with cleaned title
+            filename = ydl.prepare_filename(info)
+            # Download with cleaned info
+            ydl.process_video_result(info, download=True)
+            return filename
+    finally:
+        if progress_bar is not None:
+            progress_bar.n = progress_bar.total
+            progress_bar.refresh()
 
 
-def extract_audio(video_path, output_dir="downloads", audio_format="mp3"):
+def extract_audio(video_path, output_dir="downloads", progress_bar=None):
     """
     Extracts audio from the downloaded video using ffmpeg.
     The resulting audio file is saved with the given audio_format.
     Returns the path to the audio file.
     """
-    logging.info(f"Extracting audio from video: {video_path}")
     base, _ = os.path.splitext(os.path.basename(video_path))
-    audio_file = os.path.join(output_dir, f"{base}.{audio_format}")
+    # Clean the base name to ensure consistency
+    base = clean_filename(base)
+    audio_file = os.path.join(output_dir, f"{base}.mp3")
+    
     cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", audio_file]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logging.info(f"Extracted audio saved to: {audio_file}")
+        if progress_bar:
+            progress_bar.n = progress_bar.total
+            progress_bar.refresh()
         return audio_file
     except subprocess.CalledProcessError as e:
-        logging.error("Error extracting audio using ffmpeg")
+        print(f"\nffmpeg command failed: {' '.join(cmd)}")
+        print(f"Error output: {e.stderr.decode('utf-8')}")
         raise e
 
 
-def transcribe_audio(audio_path, model):
+def transcribe_audio(audio_path, model, progress_bar=None):
     """
     Transcribes the audio file using the provided local Whisper model.
     Returns the transcription text.
     """
-    logging.info(f"Transcribing audio: {audio_path}")
-    # Suppress FP16 warning on CPU
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
-        result = model.transcribe(audio_path)
-    transcription = result.get("text", "")
-    logging.info("Transcription complete")
-    return transcription
+        
+        try:
+            # Transcribe without progress callback (not supported by Whisper)
+            result = model.transcribe(audio_path)
+            if progress_bar:
+                progress_bar.n = progress_bar.total
+                progress_bar.refresh()
+            return result.get("text", "")
+        finally:
+            pass  # Don't close the progress bar, it's managed by the caller
 
 
 def summarize_transcription(transcription, openai_api_key):
@@ -72,77 +123,324 @@ def summarize_transcription(transcription, openai_api_key):
     Summarizes the provided transcription text using ChatGPT.
     Returns the summary text.
     """
-    logging.info("Summarizing transcription using ChatGPT")
     client = openai.OpenAI(api_key=openai_api_key)
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",  # Changed from gpt-o3-mini which was invalid
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that summarizes transcriptions."},
                 {"role": "user", "content": f"Please provide a summary for the below transcription for a short blog post, including highlights, key points and the \"meaty\" parts.\n\n---\n\n{transcription}"}
             ],
-            # max_tokens=150,
             temperature=0.5,
         )
         summary = response.choices[0].message.content.strip()
-        logging.info("Summary complete")
         return summary
     except Exception as e:
-        logging.error("Error summarizing transcription via ChatGPT")
         raise e
 
 
-def process_video(url, model, openai_api_key, output_dir="downloads"):
+def load_whisper_model(model_name="base", progress_bar=None):
     """
-    Full processing pipeline for a single video URL:
-      1. Download the video.
-      2. Extract the audio.
-      3. Transcribe the audio.
-      4. Summarize the transcription.
-      5. Save both transcription and summary to text files.
+    Loads the Whisper model and updates progress bar.
     """
     try:
-        video_path = download_video(url, output_dir)
-        audio_path = extract_audio(video_path, output_dir)
-        transcription = transcribe_audio(audio_path, model)
-        summary = summarize_transcription(transcription, openai_api_key)
-        
+        model = whisper.load_model(model_name)
+        if progress_bar:
+            progress_bar.n = progress_bar.total
+            progress_bar.refresh()
+        return model
+    except Exception as e:
+        raise e
+
+
+def normalize_filename(filename):
+    """
+    Normalizes a filename by:
+    1. Converting full-width characters to half-width
+    2. Normalizing Unicode characters
+    3. Converting to lowercase for case-insensitive comparison
+    """
+    import unicodedata
+    # Normalize Unicode characters (NFKC handles full-width to half-width conversion)
+    normalized = unicodedata.normalize('NFKC', filename)
+    # Convert to lowercase for case-insensitive comparison
+    return normalized.lower()
+
+
+def process_video(url, openai_api_key, output_dir="downloads"):
+    """
+    Process a video through multiple steps: download, audio extraction, transcription, and summarization.
+    Each step is shown with its own progress bar. Will resume from the last completed step if files exist.
+    """
+    from tqdm.auto import tqdm
+
+    # Define the steps and their descriptions
+    steps = [
+        ("Loading transcription model", load_whisper_model, ["base"]),
+        ("Downloading", download_video, [url, output_dir]),
+        ("Extracting audio", extract_audio, [None, output_dir]),
+        ("Transcribing", transcribe_audio, [None, None]),  # Model will be set after loading
+        ("Summarizing content", summarize_transcription, [None, openai_api_key])
+    ]
+    
+    progress_bars = []
+    try:
+        # Create all progress bars at start
+        for i, (desc, _, _) in enumerate(steps):
+            total = 100  # Use percentage for all bars
+            if desc == "Downloading":
+                # Download will update its total based on file size
+                total = 1
+            
+            pbar = tqdm(
+                total=total,
+                desc=desc,
+                leave=True,
+                position=i,
+                bar_format='{desc} {bar}',
+                unit='%' if total == 100 else 'B',
+                unit_scale=True if desc == "Downloading" else False
+            )
+            progress_bars.append(pbar)
+
+        # Check for existing files to determine where to resume
+        model = None
+        video_path = None
+        audio_path = None
+        transcription = None
+        summary = None
+        base = None
+
+        # First, try to get the expected video filename to determine base name
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                filename = ydl.prepare_filename(info)
+                expected_video_path = os.path.join(output_dir, os.path.basename(filename))
+                expected_base, _ = os.path.splitext(os.path.basename(filename))
+                
+                # Look for existing video file with normalized name comparison
+                expected_norm = normalize_filename(expected_base)
+                for file in os.listdir(output_dir):
+                    file_base, ext = os.path.splitext(file)
+                    if normalize_filename(file_base) == expected_norm:
+                        video_path = os.path.join(output_dir, file)
+                        base = file_base
+                        break
+                
+                if not base:
+                    base = expected_base
+                    video_path = expected_video_path
+        except Exception:
+            pass
+
+        if base:
+            # Check files in reverse order (from final step backwards)
+            # Look for files with normalized name comparison
+            base_norm = normalize_filename(base)
+            
+            # Find summary file
+            for file in os.listdir(output_dir):
+                if file.endswith("_summary.txt"):
+                    file_base = file[:-12]  # Remove "_summary.txt"
+                    if normalize_filename(file_base) == base_norm:
+                        summary_file = os.path.join(output_dir, file)
+                        if os.path.exists(summary_file):
+                            with open(summary_file, 'r', encoding='utf-8') as f:
+                                summary = f.read()
+                            # Complete all progress bars as everything is done
+                            for i in range(len(progress_bars)):
+                                progress_bars[i].n = progress_bars[i].total
+                                progress_bars[i].refresh()
+                            return {"title": base, "summary": summary}
+
+            # Find transcription file
+            for file in os.listdir(output_dir):
+                if file.endswith("_transcription.txt"):
+                    file_base = file[:-17]  # Remove "_transcription.txt"
+                    if normalize_filename(file_base) == base_norm:
+                        transcription_file = os.path.join(output_dir, file)
+                        if os.path.exists(transcription_file):
+                            with open(transcription_file, 'r', encoding='utf-8') as f:
+                                transcription = f.read()
+                            # Complete progress bars up to transcription
+                            for i in range(4):  # Load model, download, extract, transcribe
+                                progress_bars[i].n = progress_bars[i].total
+                                progress_bars[i].refresh()
+
+            # Find audio file
+            for file in os.listdir(output_dir):
+                if file.endswith(".mp3"):
+                    file_base = file[:-4]  # Remove ".mp3"
+                    if normalize_filename(file_base) == base_norm:
+                        audio_path = os.path.join(output_dir, file)
+                        if not transcription:  # Only update if not already updated by transcription check
+                            # Complete progress bars up to audio extraction
+                            for i in range(3):  # Load model, download, extract
+                                progress_bars[i].n = progress_bars[i].total
+                                progress_bars[i].refresh()
+
+            # Check video file
+            if os.path.exists(video_path):
+                if not audio_path and not transcription:  # Only update if not already updated
+                    # Complete progress bars up to download
+                    for i in range(2):  # Load model, download
+                        progress_bars[i].n = progress_bars[i].total
+                        progress_bars[i].refresh()
+            else:
+                video_path = None  # Reset if file doesn't exist
+
+        # Load the model first
+        model = load_whisper_model("base", progress_bars[0])
+
+        # Execute each remaining step
+        for i, (desc, func, args) in enumerate(steps):
+            # Skip steps that have already been completed
+            if i == 0:  # Skip model loading as it's already done
+                continue
+            if i == 1 and video_path and os.path.exists(video_path):
+                continue
+            if i == 2 and audio_path and os.path.exists(audio_path):
+                continue
+            if i == 3 and transcription:
+                continue
+            if i == 4 and summary:
+                continue
+
+            # Update arguments with results from previous steps
+            if i == 2:  # extract_audio
+                args[0] = video_path
+            elif i == 3:  # transcribe_audio
+                args[0] = audio_path
+                args[1] = model  # Set the model for transcription
+            elif i == 4:  # summarize_transcription
+                args[0] = transcription
+
+            # Add progress bar to function arguments
+            args.append(progress_bars[i])
+
+            # Execute step
+            result = func(*args)
+            
+            # Store results needed for next steps
+            if i == 1:
+                video_path = result
+            elif i == 2:
+                audio_path = result
+            elif i == 3:
+                transcription = result
+
+            # Ensure progress bar is complete
+            progress_bars[i].n = progress_bars[i].total
+            progress_bars[i].refresh()
+
         # Save the transcription and summary to separate text files
         base, _ = os.path.splitext(os.path.basename(video_path))
         transcription_file = os.path.join(output_dir, f"{base}_transcription.txt")
         summary_file = os.path.join(output_dir, f"{base}_summary.txt")
-        
+
         with open(transcription_file, "w", encoding="utf-8") as f:
             f.write(transcription)
         with open(summary_file, "w", encoding="utf-8") as f:
-            f.write(summary)
-        
-        logging.info(f"Transcription saved to: {transcription_file}")
-        logging.info(f"Summary saved to: {summary_file}")
+            f.write(result)  # result here is the summary from the last step
+
+        # Clean up files based on environment settings
+        keep_videos = os.environ.get("KEEP_VIDEOS", "false").lower() == "true"
+        keep_audio = os.environ.get("KEEP_AUDIO", "false").lower() == "true"
+        keep_transcripts = os.environ.get("KEEP_TRANSCRIPTS", "false").lower() == "true"
+
+        if not keep_videos and video_path and os.path.exists(video_path):
+            os.remove(video_path)
+        if not keep_audio and audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if not keep_transcripts:
+            if os.path.exists(transcription_file):
+                os.remove(transcription_file)
+
+        # If nothing is being kept, try to remove the downloads directory
+        if not any([keep_videos, keep_audio, keep_transcripts]):
+            try:
+                # Only remove if directory is empty
+                os.rmdir(output_dir)
+            except OSError:
+                # Directory might not be empty if there are other files, that's okay
+                pass
+
+        return {"title": base, "summary": result}
+
     except Exception as e:
-        logging.error(f"Failed processing video from URL: {url}\nError: {e}")
+        # If an error occurs, mark the current and remaining steps as failed
+        current_step = next((i for i, bar in enumerate(progress_bars) if bar.n < bar.total), len(progress_bars))
+        for i in range(current_step, len(progress_bars)):
+            progress_bars[i].set_description(f"Failed: {steps[i][0]}")
+            progress_bars[i].refresh()
+        print(f"\nError processing video {url}: {str(e)}")
+        return None
+    finally:
+        # Close all progress bars
+        for pbar in progress_bars:
+            pbar.close()
+
+
+def append_summary_to_markdown(title: str, summary: str):
+    """
+    Prepends a new summary to the summaries.md file.
+    """
+    from datetime import datetime
+    
+    # Create the markdown content for this summary
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_content = f"# {title}\n*Generated on {timestamp}*\n\n{summary}\n\n---\n\n"
+    
+    # Read existing content if file exists
+    existing_content = ""
+    if os.path.exists("summaries.md"):
+        with open("summaries.md", "r", encoding="utf-8") as f:
+            existing_content = f.read()
+    
+    # Write new content followed by existing content
+    with open("summaries.md", "w", encoding="utf-8") as f:
+        f.write(new_content + existing_content)
 
 
 def main():
     if len(sys.argv) < 2:
-        logging.error("No YouTube URLs provided.\nUsage: python script.py <YouTube URL> [<YouTube URL> ...]")
+        print("No YouTube URLs provided.\nUsage: python script.py <YouTube URL> [<YouTube URL> ...]")
         sys.exit(1)
-    
-    # Retrieve the OpenAI API key from the environment
+
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if not openai_api_key:
-        logging.error("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
+        print("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
         sys.exit(1)
-    
-    # Load the local Whisper model (using the "base" model; change as needed)
-    logging.info("Loading local Whisper model (base)")
-    model = whisper.load_model("base")
-    
-    # Process each URL provided as a command-line argument
+
     urls = sys.argv[1:]
-    for url in urls:
-        logging.info(f"Processing URL: {url}")
-        process_video(url, model, openai_api_key)
+    summaries = []
+    output_dir = "downloads"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Show overall progress for multiple videos
+    total_videos = len(urls)
+    if total_videos > 1:
+        print(f"\nProcessing {total_videos} videos:")
+    
+    try:
+        for i, url in enumerate(urls, 1):
+            if total_videos > 1:
+                print(f"\nVideo {i} of {total_videos}:")
+            result = process_video(url, openai_api_key, output_dir)
+            if result:
+                append_summary_to_markdown(result["title"], result["summary"])
+                summaries.append(result)
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Exiting gracefully.")
+        sys.exit(0)
+
+    if summaries:
+        if total_videos > 1:
+            print(f"\nSuccessfully processed {len(summaries)} of {total_videos} videos.")
+        print("\nSummaries have been added to summaries.md")
+    else:
+        print("\nNo videos processed successfully.")
 
 
 if __name__ == "__main__":
