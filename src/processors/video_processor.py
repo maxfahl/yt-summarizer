@@ -68,4 +68,25 @@ class VideoProcessor:
                 video_path=video_path
             )
 
+    def extract_audio(self, video: Video) -> str:
+        """Extracts audio from the video file"""
+        video_dir = self._get_video_dir(video.id)
+        audio_path = os.path.join(video_dir, "audio.mp3")
+        
+        cmd = ["ffmpeg", "-y", "-i", video.video_path, "-vn", "-acodec", "mp3", audio_path]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return audio_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg error: {e.stderr.decode('utf-8')}")
+            raise
+
+    def transcribe_audio(self, audio_path: str) -> str:
+        """Transcribes the audio file using Whisper"""
+        if self.model is None:
+            self.model = whisper.load_model("base")
+        
+        result = self.model.transcribe(audio_path)
+        return result["text"]
+
     # ... Rest of the methods (extract_audio, transcribe_audio, etc.) will follow similar pattern 
