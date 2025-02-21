@@ -23,14 +23,13 @@ def clean_filename(s):
 def download_video(url, output_dir="downloads", progress_bar=None):
     """
     Downloads a YouTube video from the given URL using yt-dlp.
-    The video is saved in the specified output directory.
+    The video is saved in the specified output directory using the video ID.
     Returns the path to the downloaded video file.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     def progress_hook(d):
         if d['status'] == 'downloading':
-            # Update downloaded bytes
             if progress_bar is not None:
                 current = d.get('downloaded_bytes', 0)
                 total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
@@ -49,7 +48,7 @@ def download_video(url, output_dir="downloads", progress_bar=None):
 
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
-        'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
+        'outtmpl': os.path.join(output_dir, '%(id)s.%(ext)s'),
         'noplaylist': True,
         'progress_hooks': [progress_hook],
         'quiet': True,
@@ -60,13 +59,13 @@ def download_video(url, output_dir="downloads", progress_bar=None):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # First get info and clean the title
+            # Extract info and get video ID
             info = ydl.extract_info(url, download=False)
-            info['title'] = clean_filename(info['title'])
-            # Prepare filename with cleaned title
-            filename = ydl.prepare_filename(info)
-            # Download with cleaned info
+            video_id = info['id']
+            # Download the video
             ydl.process_video_result(info, download=True)
+            # Get the actual filename (with extension)
+            filename = os.path.join(output_dir, f"{video_id}.{info['ext']}")
             return filename
     finally:
         if progress_bar is not None:
@@ -209,76 +208,55 @@ def process_video(url, openai_api_key, output_dir="downloads"):
         audio_path = None
         transcription = None
         summary = None
-        base = None
+        video_id = None
+        video_title = None
 
-        # First, try to get the expected video filename to determine base name
+        # First, try to get the video ID and expected filenames
         try:
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
                 info = ydl.extract_info(url, download=False)
-                filename = ydl.prepare_filename(info)
-                expected_video_path = os.path.join(output_dir, os.path.basename(filename))
-                expected_base, _ = os.path.splitext(os.path.basename(filename))
-                
-                # Look for existing video file with normalized name comparison
-                expected_norm = normalize_filename(expected_base)
+                video_id = info['id']
+                video_title = info['title']
+                # Look for existing video file
                 for file in os.listdir(output_dir):
-                    file_base, ext = os.path.splitext(file)
-                    if normalize_filename(file_base) == expected_norm:
+                    base, ext = os.path.splitext(file)
+                    if base == video_id:
                         video_path = os.path.join(output_dir, file)
-                        base = file_base
                         break
-                
-                if not base:
-                    base = expected_base
-                    video_path = expected_video_path
         except Exception:
             pass
 
-        if base:
+        if video_id:
             # Check files in reverse order (from final step backwards)
-            # Look for files with normalized name comparison
-            base_norm = normalize_filename(base)
-            
             # Find summary file
-            for file in os.listdir(output_dir):
-                if file.endswith("_summary.txt"):
-                    file_base = file[:-12]  # Remove "_summary.txt"
-                    if normalize_filename(file_base) == base_norm:
-                        summary_file = os.path.join(output_dir, file)
-                        if os.path.exists(summary_file):
-                            with open(summary_file, 'r', encoding='utf-8') as f:
-                                summary = f.read()
-                            # Complete all progress bars as everything is done
-                            for i in range(len(progress_bars)):
-                                progress_bars[i].n = progress_bars[i].total
-                                progress_bars[i].refresh()
-                            return {"title": base, "summary": summary}
+            summary_file = os.path.join(output_dir, f"{video_id}_summary.txt")
+            if os.path.exists(summary_file):
+                with open(summary_file, 'r', encoding='utf-8') as f:
+                    summary = f.read()
+                # Complete all progress bars as everything is done
+                for i in range(len(progress_bars)):
+                    progress_bars[i].n = progress_bars[i].total
+                    progress_bars[i].refresh()
+                return {"id": video_id, "title": video_title, "summary": summary}
 
             # Find transcription file
-            for file in os.listdir(output_dir):
-                if file.endswith("_transcription.txt"):
-                    file_base = file[:-17]  # Remove "_transcription.txt"
-                    if normalize_filename(file_base) == base_norm:
-                        transcription_file = os.path.join(output_dir, file)
-                        if os.path.exists(transcription_file):
-                            with open(transcription_file, 'r', encoding='utf-8') as f:
-                                transcription = f.read()
-                            # Complete progress bars up to transcription
-                            for i in range(4):  # Load model, download, extract, transcribe
-                                progress_bars[i].n = progress_bars[i].total
-                                progress_bars[i].refresh()
+            transcription_file = os.path.join(output_dir, f"{video_id}_transcription.txt")
+            if os.path.exists(transcription_file):
+                with open(transcription_file, 'r', encoding='utf-8') as f:
+                    transcription = f.read()
+                # Complete progress bars up to transcription
+                for i in range(4):  # Load model, download, extract, transcribe
+                    progress_bars[i].n = progress_bars[i].total
+                    progress_bars[i].refresh()
 
             # Find audio file
-            for file in os.listdir(output_dir):
-                if file.endswith(".mp3"):
-                    file_base = file[:-4]  # Remove ".mp3"
-                    if normalize_filename(file_base) == base_norm:
-                        audio_path = os.path.join(output_dir, file)
-                        if not transcription:  # Only update if not already updated by transcription check
-                            # Complete progress bars up to audio extraction
-                            for i in range(3):  # Load model, download, extract
-                                progress_bars[i].n = progress_bars[i].total
-                                progress_bars[i].refresh()
+            audio_path = os.path.join(output_dir, f"{video_id}.mp3")
+            if os.path.exists(audio_path):
+                if not transcription:  # Only update if not already updated by transcription check
+                    # Complete progress bars up to audio extraction
+                    for i in range(3):  # Load model, download, extract
+                        progress_bars[i].n = progress_bars[i].total
+                        progress_bars[i].refresh()
 
             # Check video file
             if os.path.exists(video_path):
@@ -312,7 +290,7 @@ def process_video(url, openai_api_key, output_dir="downloads"):
                 args[0] = video_path
             elif i == 3:  # transcribe_audio
                 args[0] = audio_path
-                args[1] = model  # Set the model for transcription
+                args[1] = model
             elif i == 4:  # summarize_transcription
                 args[0] = transcription
 
@@ -325,6 +303,8 @@ def process_video(url, openai_api_key, output_dir="downloads"):
             # Store results needed for next steps
             if i == 1:
                 video_path = result
+                # Update video_id from the actual downloaded file
+                video_id = os.path.splitext(os.path.basename(video_path))[0]
             elif i == 2:
                 audio_path = result
             elif i == 3:
@@ -335,9 +315,8 @@ def process_video(url, openai_api_key, output_dir="downloads"):
             progress_bars[i].refresh()
 
         # Save the transcription and summary to separate text files
-        base, _ = os.path.splitext(os.path.basename(video_path))
-        transcription_file = os.path.join(output_dir, f"{base}_transcription.txt")
-        summary_file = os.path.join(output_dir, f"{base}_summary.txt")
+        transcription_file = os.path.join(output_dir, f"{video_id}_transcription.txt")
+        summary_file = os.path.join(output_dir, f"{video_id}_summary.txt")
 
         with open(transcription_file, "w", encoding="utf-8") as f:
             f.write(transcription)
@@ -366,7 +345,7 @@ def process_video(url, openai_api_key, output_dir="downloads"):
                 # Directory might not be empty if there are other files, that's okay
                 pass
 
-        return {"title": base, "summary": result}
+        return {"id": video_id, "title": video_title, "summary": result}
 
     except Exception as e:
         # If an error occurs, mark the current and remaining steps as failed
@@ -382,7 +361,7 @@ def process_video(url, openai_api_key, output_dir="downloads"):
             pbar.close()
 
 
-def append_summary_to_markdown(title: str, summary: str):
+def append_summary_to_markdown(video_id: str, title: str, summary: str):
     """
     Prepends a new summary to the summaries.md file.
     """
@@ -390,7 +369,7 @@ def append_summary_to_markdown(title: str, summary: str):
     
     # Create the markdown content for this summary
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    new_content = f"# {title}\n*Generated on {timestamp}*\n\n{summary}\n\n---\n\n"
+    new_content = f"# {title} (ID: {video_id})\n*Generated on {timestamp}*\n\n{summary}\n\n---\n\n"
     
     # Read existing content if file exists
     existing_content = ""
@@ -429,7 +408,7 @@ def main():
                 print(f"\nVideo {i} of {total_videos}:")
             result = process_video(url, openai_api_key, output_dir)
             if result:
-                append_summary_to_markdown(result["title"], result["summary"])
+                append_summary_to_markdown(result["id"], result["title"], result["summary"])
                 summaries.append(result)
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Exiting gracefully.")
