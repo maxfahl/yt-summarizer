@@ -12,7 +12,7 @@ class SummaryGenerator:
     def generate_summary(self, transcription: str) -> str:
         """Generates a summary from the transcription using OpenAI's API"""
         response = self.client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4-turbo-preview",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that creates comprehensive summaries of video transcriptions. Your summaries should be informative and well-structured, capturing both the key points and the deeper context."},
                 {"role": "user", "content": f"""Please provide a comprehensive summary of this video transcription in the following format:

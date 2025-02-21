@@ -4,7 +4,7 @@ from typing import Optional
 from ..models.summary import Summary, ProcessingStatus
 
 class VideoRequest(BaseModel):
-    url: HttpUrl
+    url: str
 
 class SummaryResponse(BaseModel):
     video_id: str
