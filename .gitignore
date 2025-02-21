@@ -46,3 +46,6 @@ downloads/
 *.txt
 !requirements.txt
 !.env.example 
+
+processing/
+summaries.md
