@@ -49,3 +49,6 @@ downloads/
 
 processing/
 summaries.md
+
+.notes/*
+.tasks/*
