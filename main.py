@@ -92,16 +92,31 @@ def transcribe_audio(audio_path, model, progress_bar=None):
 def summarize_transcription(transcription, openai_api_key, progress_bar=None):
     """
     Summarizes the provided transcription text using ChatGPT.
-    Returns the summary text.
+    Returns a comprehensive summary with both highlights and detailed narrative.
     """
     client = openai.OpenAI(api_key=openai_api_key)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that summarizes transcriptions."},
-            {"role": "user", "content": f"Please provide a summary for the below transcription for a short blog post, including highlights, key points and the \"meaty\" parts.\n\n---\n\n{transcription}"}
+            {"role": "system", "content": "You are a helpful assistant that creates comprehensive summaries of video transcriptions. Your summaries should be informative and well-structured, capturing both the key points and the deeper context."},
+            {"role": "user", "content": f"""Please provide a comprehensive summary of this video transcription in the following format:
+
+## Key Highlights
+- [3-5 bullet points of the most important takeaways]
+
+## Main Points
+- [Detailed bullet points covering the major topics and arguments]
+
+## Detailed Summary
+[A few paragraphs providing a narrative summary of the content, including context, main arguments, and important details. This should be more detailed than the bullet points and help readers understand the full scope of the video.]
+
+Here's the transcription:
+
+---
+
+{transcription}"""}
         ],
-        temperature=0.5,
+        temperature=0.7,  # Slightly higher temperature for more detailed generation
     )
     if progress_bar:
         progress_bar.n = progress_bar.total
